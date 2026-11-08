@@ -184,12 +184,20 @@ cd PhageFlow
 mamba env create -f environment.yml
 conda activate phageflow
 
-# Install PhageFlow in editable mode
-pip install -e .
+# Install PhageFlow in editable mode (with test/lint tools)
+pip install -e ".[dev]"
 
 # Verify
 phageflow --version
+
+# Run the unit tests and linter (no bioinformatics tools or databases needed)
+pytest
+ruff check phageflow tests
 ```
+
+Releases: bump the version in `phageflow/__init__.py`, `pyproject.toml` and
+`conda-recipe/meta.yaml`, then push a `vX.Y.Z` tag. The release workflow refuses
+to publish if the three versions do not match the tag.
 
 > **Note on dependencies**: RGI and bacphlip are incompatible with the phageflow
 > environment (Python 3.11 + samtools ≥1.23 conflict). PhageFlow uses Phold's
@@ -242,6 +250,10 @@ Database paths are resolved in this order (highest first):
 3. User config: `~/.config/phageflow/config.yaml` (written by `download-databases`)
 4. Environment variable: `PHAGEFLOW_DB=/path/to/databases`
 5. Bundled defaults
+
+`PHAGEFLOW_DB` must contain the layout created by `download-databases`
+(`checkv_db/checkv-db-vX.Y`, `genomad_db`, `pharokka_db`, `phold_db`, `k2_db`).
+Keys missing from a project/user config fall back to `PHAGEFLOW_DB`.
 
 ### Manual setup (alternative)
 
@@ -299,7 +311,13 @@ phageflow run \
     --accessions GCF_000005845.2 \
     -o results/ \
     --from-module quality
+
+# Check progress (reads results/reports/pipeline_status.tsv)
+phageflow status -o results/
 ```
+
+`phageflow run` exits with a non-zero status if any sample failed, so it can be
+chained in SLURM/Make/CI scripts. With `--project DIR`, `-o` defaults to `DIR`.
 
 ### Run individual modules
 
@@ -689,17 +707,18 @@ identity is biologically meaningful (Pawluk et al. 2016, Science 351:aad8405).
 │   │   │   └── {naming_level}_candidate_NNN.fasta
 │   │   ├── drafts/
 │   │   └── checkv/
-│   ├── 06_annotation/{candidate_id}/
+│   ├── 06_annotation/{sample}/{candidate_id}/
 │   │   ├── pharokka/                       ← Tier 1 (GBK + TSVs)
 │   │   ├── phold/                          ← Tier 2 (canonical GBK)
 │   │   └── plots/                          ← genome map (PNG + SVG)
-│   └── 07_resistance/{candidate_id}/
+│   └── 07_resistance/{sample}/{candidate_id}/
 │       ├── {candidate_id}_amr.tsv
 │       ├── {candidate_id}_virulence.tsv
 │       ├── {candidate_id}_acr.tsv
 │       ├── {candidate_id}_defense.tsv
 │       └── {candidate_id}_toxin_antitoxin.tsv
 └── reports/
+    ├── pipeline_status.tsv                 ← per-sample/module progress (phageflow status)
     ├── 01_qc/{sample}/qc_summary.tsv
     ├── 02_host_removal/{sample}/host_removal_summary.tsv
     ├── 03_assembly/{sample}/assembly_summary.tsv
@@ -709,11 +728,11 @@ identity is biologically meaningful (Pawluk et al. 2016, Science 351:aad8405).
     │   └── rename_map.tsv                  ← critical metadata link
     ├── 06_annotation/
     │   ├── annotation_summary.tsv          ← aggregate (all candidates)
-    │   └── {candidate_id}/
+    │   └── {sample}/{candidate_id}/
     │       └── {candidate_id}_delta_report.tsv
     └── 07_resistance/
         ├── resistance_aggregate.tsv        ← all candidates
-        └── {candidate_id}/{candidate_id}_resistance_summary.tsv
+        └── {sample}/{candidate_id}/{candidate_id}_resistance_summary.tsv
 ```
 
 ### Key files for downstream use
@@ -722,9 +741,9 @@ identity is biologically meaningful (Pawluk et al. 2016, Science 351:aad8405).
 |------|-------------|
 | `results/05_quality/{sample}/annotation_ready/phages/*.fasta` | Annotation-ready genomes |
 | `reports/05_quality/{sample}/rename_map.tsv` | Full metadata per contig |
-| `results/06_annotation/{candidate}/phold/{candidate}.gbk` | Canonical annotated GBK |
+| `results/06_annotation/{sample}/{candidate}/phold/{candidate}.gbk` | Canonical annotated GBK |
 | `reports/06_annotation/annotation_summary.tsv` | Annotation statistics |
-| `reports/06_annotation/{candidate}/{candidate}_delta_report.tsv` | Per-CDS provenance |
+| `reports/06_annotation/{sample}/{candidate}/{candidate}_delta_report.tsv` | Per-CDS provenance |
 | `reports/07_resistance/resistance_aggregate.tsv` | Biosafety summary all candidates |
 
 ---
@@ -751,7 +770,7 @@ Commands:
 Options (all commands):
   -c, --config       Path to config.yaml [default: config/config.yaml]
   -w, --workdir      Pipeline working directory
-  -o, --output-dir   Base output directory
+  -o, --output-dir   Base output directory (defaults to PROJECT with --project)
   --reports-dir      Override reports directory
   -t, --threads      CPU threads [default: auto 90% of logical CPUs]
   --force            Force re-run even if outputs exist

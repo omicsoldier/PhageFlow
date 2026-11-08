@@ -58,10 +58,8 @@ Prodigal genetic code
 
 from __future__ import annotations
 import csv
-import shutil
 from collections import Counter
 from pathlib import Path
-from typing import Optional
 
 from rich.panel import Panel
 from rich.progress import (
@@ -196,7 +194,11 @@ def _run_genomad(
         "--quiet",
         "--cleanup",                   # remove large annotate/ intermediate dir
         "--sensitivity", str(cfg.genomad.sensitivity),
-        "--min-score", str(cfg.genomad.min_score),
+        # geNomad drops everything below --min-score from virus_summary.tsv.
+        # Use the lower rescue threshold here; _parse_virus_summary() applies
+        # the main/rescued tiers afterwards. Otherwise the rescue tier could
+        # never contain any contig.
+        "--min-score", str(min(cfg.genomad.min_score, cfg.genomad.rescue_min_score)),
         "--min-virus-hallmarks", str(cfg.genomad.min_hallmarks),
     ]
 
@@ -425,10 +427,11 @@ def _parse_genetic_codes_from_genes(path: Path, viral_seqs: set) -> dict:
     with open(path, newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         for row in reader:
-            seq = row.get("seq_name", "").strip()
-            # virus_genes.tsv has format "seq_name|start|stop" for the gene ID;
-            # the contig name is the first part
-            contig = seq.split("|")[0] if "|" in seq else seq
+            # virus_genes.tsv identifies genes as "<contig>_<n>" in the "gene"
+            # column. Contig names may themselves contain "|" or "_"
+            # (e.g. "SPAdes|NODE_1_length_..."), so strip only the gene index.
+            gene = (row.get("gene") or row.get("seq_name") or "").strip()
+            contig = gene.rsplit("_", 1)[0] if "_" in gene else gene
             if contig not in viral_seqs:
                 continue
             try:

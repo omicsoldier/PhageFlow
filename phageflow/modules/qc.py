@@ -188,7 +188,8 @@ def run(
     log_step(f"Module 01 — QC  [{sample_id}]")
     log_info(f"  {sample_id}  ·  R1: {human_size(r1)}  ·  R2: {human_size(r2)}")
 
-    if r1_out.exists() and r1_out.stat().st_size > 0 and not force:
+    if (not force and json_f.exists()
+            and all(p.exists() and p.stat().st_size > 0 for p in (r1_out, r2_out))):
         log_info("  Already processed — skipping  (--force to re-run)")
         return r1_out, r2_out
 
@@ -288,7 +289,14 @@ def _run_fastp(
             "--trim_poly_x",
             "--poly_x_min_len", str(q.poly_x_min_len),
         ]
-    run_silent(cmd, log_file=log_f)
+    # Remove a stale JSON first: it doubles as the "module finished" marker.
+    json_f.unlink(missing_ok=True)
+    try:
+        run_silent(cmd, log_file=log_f)
+    except Exception:
+        for p in (r1_out, r2_out, json_f):
+            Path(p).unlink(missing_ok=True)
+        raise
 
 def _run_fastqc(r1: Path, r2: Path, out_dir: Path, log_f: Path) -> None:
     def _one(read: Path) -> None:
@@ -468,7 +476,7 @@ def _save_tsv(sample_id: str, m: dict, path: Path) -> None:
         "gc_pct":            m.get("gc_pct", ""),
         "dup_pct":           m.get("dup_pct", ""),
         "bp_out":            m.get("bp_out", ""),
-        "est_coverage_50kb": m.get("est_coverage", ""),
+        "est_coverage_50kb": m.get("est_coverage_typical", ""),
     }
 
     with open(path, "w") as f:

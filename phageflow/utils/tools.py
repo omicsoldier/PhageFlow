@@ -1,13 +1,14 @@
 """PhageFlow external tool execution utilities."""
 
 from __future__ import annotations
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional, Union
 
-from .logger import log_info, log_ok, log_warn, log_error
+from .logger import log_info, log_warn, log_error
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,30 @@ def run_silent(
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
     return result
+
+
+def q(path) -> str:
+    """Shell-quote a path/argument for use inside a shell pipeline string."""
+    return shlex.quote(str(path))
+
+
+def run_pipeline(
+    cmd: str,
+    log_file: Optional[Path] = None,
+    check: bool = True,
+    cwd: Optional[Path] = None,
+) -> subprocess.CompletedProcess:
+    """Run a shell pipeline under ``bash -o pipefail``.
+
+    With plain ``/bin/sh`` a pipeline's exit status is that of its *last*
+    command, so a crash in e.g. ``bwa-mem2 | samtools ...`` would go unnoticed
+    and leave truncated outputs behind.  ``pipefail`` propagates the failure.
+    Callers must quote paths with :func:`q`.
+    """
+    return run_silent(
+        ["bash", "-o", "pipefail", "-c", cmd],
+        log_file=log_file, check=check, cwd=cwd,
+    )
 
 
 # ---------------------------------------------------------------------------

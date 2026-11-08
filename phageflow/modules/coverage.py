@@ -64,10 +64,7 @@ Output
 
 from __future__ import annotations
 import math
-import subprocess
-import shutil
 from pathlib import Path
-from typing import Optional
 
 from rich.panel import Panel
 from rich.progress import (
@@ -77,7 +74,7 @@ from rich.progress import (
 
 from phageflow.utils.config import Config
 from phageflow.utils.logger import (
-    log_step, log_info, log_ok, log_warn, log_error, console,
+    log_step, log_info, log_ok, log_warn, console,
 )
 from phageflow.utils.tools import require_tools, run_silent, mkdirs
 
@@ -243,7 +240,8 @@ def _parse_coverage(coverage_tsv: Path) -> list[dict]:
         # Normalize headers by extracting just the metric suffix.
         def _metric(col: str) -> str:
             """Strip file path prefix from CoverM column header."""
-            for suffix in ("Mean", "Trimmed Mean", "Covered Bases", "Variance"):
+            # Longest suffix first: "Trimmed Mean" also ends with "Mean".
+            for suffix in ("Trimmed Mean", "Covered Bases", "Variance", "Mean"):
                 if col.endswith(suffix):
                     return suffix
             return col
@@ -314,7 +312,6 @@ def _evaluate_coverage(
     for m in metrics:
         mean    = m["mean_cov"]
         cv      = m["cv"]
-        covered = m["covered_bases"]
 
         if mean < _MIN_COV_WARN and mean > 0:
             n_low_cov += 1
