@@ -7,7 +7,6 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 
 _STATUS_HEADERS = [

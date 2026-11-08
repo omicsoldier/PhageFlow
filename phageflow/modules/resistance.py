@@ -65,7 +65,6 @@ host manipulation. NetFlax detects phage TA systems via structural homology.
 from __future__ import annotations
 import csv
 from pathlib import Path
-from typing import Optional
 
 from rich.panel import Panel
 from rich.progress import (
@@ -114,8 +113,9 @@ def run(
     -------
     Path to resistance_summary.tsv
     """
-    out_dir = cfg.results(STEP) / candidate_id
-    rpt_dir = cfg.reports(STEP) / candidate_id
+    # Scoped by sample: candidate IDs are numbered per sample.
+    out_dir = cfg.results(STEP) / sample_id / candidate_id
+    rpt_dir = cfg.reports(STEP) / sample_id / candidate_id
     mkdirs(out_dir, rpt_dir)
 
     summary_tsv = rpt_dir / f"{candidate_id}_resistance_summary.tsv"
@@ -127,7 +127,11 @@ def run(
         return summary_tsv
 
     # Locate annotation outputs
-    ann_dir     = cfg.results("06_annotation") / candidate_id
+    ann_dir = cfg.results("06_annotation") / sample_id / candidate_id
+    if not ann_dir.exists():
+        legacy = cfg.results("06_annotation") / candidate_id   # legacy layout (before per-sample scoping)
+        if (legacy / "pharokka").exists():
+            ann_dir = legacy
     pharokka_dir = ann_dir / "pharokka"
     phold_dir    = ann_dir / "phold"
 
@@ -614,19 +618,20 @@ def _update_aggregate_tsv(
         "n_acr", "n_defense", "n_toxin_antitoxin",
         "biosafety_flag",
     ]
-    rows: dict[str, dict] = {}
+    rows: dict[tuple[str, str], dict] = {}
     if path.exists():
         with open(path) as f:
             old_h = f.readline().rstrip("\n").split("\t")
             for line in f:
                 cols = line.rstrip("\n").split("\t")
                 if cols and cols[0]:
-                    rows[cols[0]] = dict(zip(old_h, cols))
+                    row = dict(zip(old_h, cols))
+                    rows[(row.get("sample_id", ""), row.get("candidate_id", cols[0]))] = row
 
     n_amr_high = sum(1 for h in amr_hits if h.get("confidence") == "high")
     n_vf_high  = sum(1 for h in vf_hits  if h.get("confidence") == "high")
     flag = "YES" if (amr_hits or vf_hits) else "NO"
-    rows[candidate_id] = {
+    rows[(sample_id, candidate_id)] = {
         "candidate_id":          candidate_id,
         "sample_id":             sample_id,
         "n_amr":                 str(len(amr_hits)),

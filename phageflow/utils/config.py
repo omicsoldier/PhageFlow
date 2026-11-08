@@ -112,10 +112,18 @@ class EnvConfig:
 # Main Config
 # ---------------------------------------------------------------------------
 
+def _package_version() -> str:
+    try:
+        from phageflow import __version__
+        return __version__
+    except Exception:  # pragma: no cover - defensive during partial imports
+        return "unknown"
+
+
 @dataclass
 class Config:
     project:   str  = "PhageFlow"
-    version:   str  = "0.1.0"
+    version:   str  = field(default_factory=_package_version)
     threads:   int  = field(default_factory=_default_threads)
     memory_gb: int  = 32
     workdir:   Path = Path(".")
@@ -192,63 +200,94 @@ def _find_db_path() -> Optional[Path]:
     import os
     db_env = os.environ.get("PHAGEFLOW_DB")
     if db_env:
-        p = Path(db_env)
+        p = Path(db_env).expanduser()
         if p.exists():
             return p
     return None
 
 
-def load_config(config_path: Path, workdir: Optional[Path] = None) -> Config:
-    """Load config.yaml and return a fully resolved Config object."""
+# Sub-directory layout expected under $PHAGEFLOW_DB (matches download-databases).
+_ENV_DB_LAYOUT = {
+    "checkv":   Path("checkv_db") / "checkv-db-v1.5",
+    "genomad":  Path("genomad_db"),
+    "pharokka": Path("pharokka_db"),
+    "phold":    Path("phold_db"),
+    "kraken2":  Path("k2_db"),
+}
+
+
+def _env_db_paths(db_root: Path) -> dict[str, Path]:
+    """Database paths under a PHAGEFLOW_DB root.
+
+    CheckV creates a versioned sub-directory (checkv-db-vX.Y); pick the newest
+    one present instead of hard-coding v1.5.
+    """
+    paths = {k: db_root / v for k, v in _ENV_DB_LAYOUT.items()}
+    versions = sorted((db_root / "checkv_db").glob("checkv-db-v*"))
+    if versions:
+        paths["checkv"] = versions[-1]
+    return paths
+
+
+def load_config(
+    config_path: Path,
+    workdir: Optional[Path] = None,
+    is_bundled: bool = False,
+) -> Config:
+    """Load config.yaml and return a fully resolved Config object.
+
+    Database path priority (highest first):
+      1. ``databases:`` entries of a user/project config file
+      2. ``$PHAGEFLOW_DB`` environment variable
+      3. ``databases:`` entries of the bundled default config / dataclass defaults
+
+    ``is_bundled`` marks *config_path* as the packaged default_config.yaml, whose
+    relative database paths are placeholders and must not mask PHAGEFLOW_DB.
+    """
+    config_path = Path(config_path)
     with open(config_path) as f:
-        raw = yaml.safe_load(f)
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config file {config_path} must contain a YAML mapping")
 
     cfg         = Config()
-    cfg.workdir = workdir or config_path.parent.parent
+    cfg.workdir = Path(workdir) if workdir else config_path.parent.parent
     cfg.project = raw.get("project", cfg.project)
 
-    if "threads" in raw:
-        cfg.threads = int(raw["threads"])
-    if "memory_gb" in raw:
+    if raw.get("threads") is not None:
+        cfg.threads = max(1, int(raw["threads"]))
+    if raw.get("memory_gb") is not None:
         cfg.memory_gb = int(raw["memory_gb"])
 
-    # Output / report directories
-    if "dirs" in raw:
-        d = raw["dirs"]
-        if "results" in d:
-            p = d["results"]
-            cfg._output_dir = Path(p) if Path(p).is_absolute() else cfg.workdir / p
-        if "reports" in d:
-            p = d["reports"]
-            cfg._reports_dir = Path(p) if Path(p).is_absolute() else cfg.workdir / p
+    def _resolve(p) -> Path:
+        p = Path(str(p)).expanduser()
+        return p if p.is_absolute() else cfg.workdir / p
 
-    # databases — environment variable overrides config
-    db_env_path = _find_db_path()
-    if db_env_path:
-        cfg.databases.checkv   = db_env_path / "checkv_db" / "checkv-db-v1.5"
-        cfg.databases.genomad  = db_env_path / "genomad_db"
-        cfg.databases.pharokka = db_env_path / "pharokka_db"
-        cfg.databases.phold    = db_env_path / "phold_db"
-        cfg.databases.kraken2  = db_env_path / "k2_db"
+    # Output / report directories
+    d = raw.get("dirs") or {}
+    if d.get("results"):
+        cfg._output_dir = _resolve(d["results"])
+    if d.get("reports"):
+        cfg._reports_dir = _resolve(d["reports"])
 
     # databases
-    if "databases" in raw:
-        db = raw["databases"]
-        def _db(key: str, default: Path) -> Path:
-            v = db.get(key, str(default))
-            return Path(v) if Path(v).is_absolute() else cfg.workdir / v
-        cfg.databases.checkv   = _db("checkv",   cfg.databases.checkv)
-        cfg.databases.pharokka = _db("pharokka", cfg.databases.pharokka)
-        cfg.databases.genomad  = _db("genomad",  cfg.databases.genomad)
-        cfg.databases.phold    = _db("phold",    cfg.databases.phold)
-        if "kraken2" in db:
-            cfg.databases.kraken2 = cfg.workdir / db["kraken2"]
+    db_raw = raw.get("databases") or {}
+    db_env = _find_db_path()
+    env_paths = _env_db_paths(db_env) if db_env else {}
+    for key in ("checkv", "pharokka", "genomad", "phold", "kraken2"):
+        explicit = db_raw.get(key)
+        if explicit and not (is_bundled and key in env_paths):
+            setattr(cfg.databases, key, _resolve(explicit))
+        elif key in env_paths:
+            setattr(cfg.databases, key, env_paths[key])
+        elif key != "kraken2":
+            setattr(cfg.databases, key, _resolve(getattr(cfg.databases, key)))
 
-    if "envs" in raw:
+    if raw.get("envs"):
         cfg.envs.main = raw["envs"].get("main", cfg.envs.main)
 
     # qc
-    if "qc" in raw:
+    if raw.get("qc"):
         q = raw["qc"]
         cfg.qc.average_qual               = int(  q.get("average_qual",               cfg.qc.average_qual))
         cfg.qc.qualified_quality_phred    = int(  q.get("qualified_quality_phred",    cfg.qc.qualified_quality_phred))
@@ -266,22 +305,22 @@ def load_config(config_path: Path, workdir: Optional[Path] = None) -> Config:
         cfg.qc.n_base_limit               = int(  q.get("n_base_limit",               cfg.qc.n_base_limit))
 
     # assembly
-    if "assembly" in raw:
+    if raw.get("assembly"):
         a = raw["assembly"]
         cfg.assembly.kmers               = a.get("kmers",      cfg.assembly.kmers)
         cfg.assembly.min_length          = int(a.get("min_length", cfg.assembly.min_length))
         cfg.assembly.iterative_refinement = bool(a.get("iterative_refinement", cfg.assembly.iterative_refinement))
 
     # host_removal
-    if "host_removal" in raw:
+    if raw.get("host_removal"):
         hr = raw["host_removal"]
-        cfg.host_removal.always_include_accessions = list(hr.get("always_include_accessions", []))
+        cfg.host_removal.always_include_accessions = list(hr.get("always_include_accessions") or [])
         cfg.host_removal.kraken2_postfilter        = bool(hr.get("kraken2_postfilter",   cfg.host_removal.kraken2_postfilter))
         cfg.host_removal.postfilter_min_pct        = float(hr.get("postfilter_min_pct",  cfg.host_removal.postfilter_min_pct))
         cfg.host_removal.contamination_warn_pct    = float(hr.get("contamination_warn_pct", cfg.host_removal.contamination_warn_pct))
 
     # genomad
-    if "genomad" in raw:
+    if raw.get("genomad"):
         g = raw["genomad"]
         cfg.genomad.min_score            = float(g.get("min_score",    cfg.genomad.min_score))
         cfg.genomad.min_hallmarks        = int(g.get("min_virus_hallmarks", g.get("min_hallmarks", cfg.genomad.min_hallmarks)))
@@ -295,7 +334,7 @@ def load_config(config_path: Path, workdir: Optional[Path] = None) -> Config:
         cfg.genomad.lenient_taxonomy         = bool(g.get("lenient_taxonomy", cfg.genomad.lenient_taxonomy))
 
     # checkv
-    if "checkv" in raw:
+    if raw.get("checkv"):
         c = raw["checkv"]
         cfg.checkv.min_completeness   = float(c.get("min_completeness",   cfg.checkv.min_completeness))
         cfg.checkv.min_viral_genes    = int(  c.get("min_viral_genes",    cfg.checkv.min_viral_genes))
@@ -308,7 +347,7 @@ def load_config(config_path: Path, workdir: Optional[Path] = None) -> Config:
         cfg.checkv.max_genome_copies  = float(c.get("max_genome_copies",  cfg.checkv.max_genome_copies))
 
     # annotate
-    if "annotate" in raw:
+    if raw.get("annotate"):
         a = raw["annotate"]
         cfg.annotate.phold_gpu           = bool( a.get("phold_gpu",           cfg.annotate.phold_gpu))
         cfg.annotate.phold_finetune      = bool( a.get("phold_finetune",      cfg.annotate.phold_finetune))

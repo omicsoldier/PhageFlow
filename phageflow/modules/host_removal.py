@@ -46,7 +46,6 @@ Singleton recovery rationale
 """
 from __future__ import annotations
 import subprocess
-import sys
 import zipfile
 import shutil
 from pathlib import Path
@@ -62,7 +61,9 @@ from phageflow.utils.config import Config
 from phageflow.utils.logger import (
     log_step, log_info, log_ok, log_warn, log_error, console,
 )
-from phageflow.utils.tools import require_tools, run_silent, human_size, mkdirs
+from phageflow.utils.tools import (
+    require_tools, run_silent, run_pipeline, q, human_size, mkdirs,
+)
 
 STEP          = "02_host_removal"
 TOOLS_BWA     = ["bwa-mem2", "samtools"]
@@ -125,9 +126,12 @@ def run(
         require_tools(*TOOLS_BWA)
         _check_samtools_version()
         combined = host_dir / "combined_hosts.fasta"
-        _host_label = ", ".join(accessions) if accessions else (
-            host_file.name if host_file else "config defaults"
-        )
+        if accessions:
+            _host_label = ", ".join(accessions)
+        elif host_file:
+            _host_label = Path(host_file).name
+        else:
+            _host_label = f"accessions file {Path(accessions_file).name}"
         log_info(f"  mode: bwa-mem2  ·  host: {_host_label}")
         n_steps = 3
     else:
@@ -142,7 +146,11 @@ def run(
                 "    --kraken-db /path/to/k2_db\n"
                 "  Or set databases.kraken2 in config.yaml"
             )
-            sys.exit(1)
+            # Raise (not sys.exit) so `phageflow run` can continue with the
+            # next sample and record the failure.
+            raise FileNotFoundError(
+                f"No host reference and no Kraken2 database found (kraken2 db: {db})"
+            )
         log_info(f"  mode: Kraken2  ·  db: {Path(str(db)).name}")
         if cfg.host_removal.kraken2_postfilter:
             log_info("  Kraken2 postfilter: bwa-mem2 active (recovers DTR/ITR singletons)")
@@ -353,21 +361,28 @@ def _run_bwa_pipeline(
 ) -> dict:
     sort_prefix = tmp_dir / f"{sample_id}.sort"
 
-    cmd = (
-        # Permissive alignment parameters for host removal sensitivity:
+    # Permissive alignment parameters for host removal sensitivity:
     # -A 1 -B 2 -O 2,2: lower mismatch/gap penalties capture divergent host strains
     # that default parameters would fail to map, preventing false non-host retention.
     # Schmieder & Edwards 2011 (Bioinformatics 27:863)
-    f"bwa-mem2 mem -t {threads} -A 1 -B 2 -O 2,2 -M {combined} {r1} {r2} "
+    cmd = (
+        f"bwa-mem2 mem -t {threads} -A 1 -B 2 -O 2,2 -M {q(combined)} {q(r1)} {q(r2)} "
         f"| samtools view -@ {min(threads,8)} -bF 2304 -u "
-        f"| samtools sort -@ {min(threads,8)} -n -u -T {sort_prefix} - "
+        f"| samtools sort -@ {min(threads,8)} -n -u -T {q(sort_prefix)} - "
         f"| samtools fastq -@ {min(threads,4)} -N "
         f"  -f 4 -F 256 "
-        f"  -1 {r1_out} -2 {r2_out} "
-        f"  -s {singleton_out} "
+        f"  -1 {q(r1_out)} -2 {q(r2_out)} "
+        f"  -s {q(singleton_out)} "
         f"  -0 /dev/null"
     )
-    run_silent(cmd, log_file=log_f, shell=True)
+    try:
+        run_pipeline(cmd, log_file=log_f)
+    except Exception:
+        # Never leave truncated FASTQs behind: the next run would treat them
+        # as finished outputs and skip the module.
+        for p in (r1_out, r2_out, singleton_out):
+            Path(p).unlink(missing_ok=True)
+        raise
 
     n_in  = _count_reads_fastq(r1,           threads)
     n_out = _count_reads_fastq(r1_out,        threads)
@@ -393,7 +408,7 @@ def _count_reads_fastq(path: Path, threads: int = 4) -> int:
         return 0
     try:
         decomp = f"pigz -dc -p {threads}" if shutil.which("pigz") else "gzip -dc"
-        r = subprocess.run(["bash", "-c", f"{decomp} {path} | wc -l"],
+        r = subprocess.run(["bash", "-o", "pipefail", "-c", f"{decomp} {q(path)} | wc -l"],
                            capture_output=True, text=True, timeout=600)
         return int(r.stdout.strip()) // 4
     except Exception:
@@ -424,7 +439,7 @@ def _level_a_check(
     for src, dst in [(r1_phage, sub_r1), (r2_phage, sub_r2)]:
         try:
             subprocess.run(
-                ["bash", "-c", f"seqtk sample -s42 {src} {_LEVEL_A_SUBSAMPLE} > {dst}"],
+                ["bash", "-c", f"seqtk sample -s42 {q(src)} {_LEVEL_A_SUBSAMPLE} > {q(dst)}"],
                 capture_output=True, timeout=120,
             )
         except Exception:
@@ -468,13 +483,14 @@ def _level_a_check(
                 name     = name_raw.strip()
             except (ValueError, IndexError):
                 continue
+            rank = parts[3].strip()
             if name == "Bacteria":
                 bacteria_pct = pct; in_bacteria = True; bact_depth = depth
                 continue
             if in_bacteria:
                 if depth <= bact_depth:
                     in_bacteria = False
-                elif pct >= warn_pct and depth == bact_depth + 2:
+                elif pct >= warn_pct and rank == "G":
                     top_contaminants.append((name, pct))
 
     if bacteria_pct > warn_pct:
@@ -533,7 +549,6 @@ def _level_b_postfilter(
     )
     for p in (r1_k2, r2_k2): p.unlink(missing_ok=True)
 
-    n_out = _count_reads_fastq(r1_out, cfg.threads)
     n_sin = _count_reads_fastq(singleton_out, cfg.threads)
     if n_sin:
         log_ok(f"  [Level B] {n_sin:,} DTR/ITR singletons recovered from Kraken2 loss")
@@ -549,6 +564,7 @@ def _parse_contaminants_from_report(report: Path, min_pct: float) -> list[int]:
             if len(parts) < 6: continue
             try:
                 pct = float(parts[0]); taxid = int(parts[4].strip())
+                rank = parts[3].strip()
                 name_raw = parts[5]; depth = len(name_raw) - len(name_raw.lstrip())
                 name = name_raw.strip()
             except (ValueError, IndexError): continue
@@ -556,7 +572,10 @@ def _parse_contaminants_from_report(report: Path, min_pct: float) -> list[int]:
                 in_bacteria = True; bact_depth = depth; continue
             if in_bacteria:
                 if depth <= bact_depth: break
-                if pct >= min_pct: taxids.append(taxid)
+                # Species rank only: `datasets download genome taxon <id>
+                # --reference` on a genus/phylum taxid pulls many genomes.
+                if rank == "S" and pct >= min_pct:
+                    taxids.append(taxid)
     return taxids
 
 def _download_by_taxids(taxids: list[int], dest_dir: Path, rpt_dir: Path) -> List[Path]:
@@ -590,15 +609,13 @@ def _download_by_taxids(taxids: list[int], dest_dir: Path, rpt_dir: Path) -> Lis
 def _classify_kraken2(sample_id, r1, r2, db, tmp_dir, rpt_dir, log_f, threads) -> tuple:
     report = rpt_dir / f"{sample_id}_k2.report"
     k2_out = tmp_dir  / f"{sample_id}_k2.tsv"
-    un_r1 = tmp_dir / f"{sample_id}_unclassified_1.fastq"
-    un_r2 = tmp_dir / f"{sample_id}_unclassified_2.fastq"
     run_silent([
         "kraken2", "--db", str(db), "--report", str(report),
         "--output", str(k2_out),
         "--unclassified-out", str(tmp_dir / f"{sample_id}_unclassified#.fastq"),
         "--paired", "--confidence", "0.5", "--minimum-hit-groups", "3",
         "--threads", str(threads), str(r1), str(r2),
-    ], log_file=log_f, check=False)
+    ], log_file=log_f)
     return report, k2_out
 
 def _extract_phage_kraken2(sample_id, r1, r2, r1_out, r2_out,
@@ -677,13 +694,18 @@ def _merge_reads(un_r1, un_r2, src_r1, src_r2, r1_out, r2_out,
     cmds: list[str] = []
     for un, src, out in [(un_r1, src_r1, r1_out), (un_r2, src_r2, r2_out)]:
         if un.exists() and has_viral:
-            cmds.append(f"{{ {zip_c} {un}; seqtk subseq {src} {viral_ids} | {zip_pipe}; }} > {out}")
+            cmds.append(
+                f"{{ {zip_c} {q(un)} && seqtk subseq {q(src)} {q(viral_ids)} | {zip_pipe}; }} > {q(out)}"
+            )
         elif un.exists():
-            cmds.append(f"{zip_c} {un} > {out}")
+            cmds.append(f"{zip_c} {q(un)} > {q(out)}")
         elif has_viral:
-            cmds.append(f"seqtk subseq {src} {viral_ids} | {zip_pipe} > {out}")
+            cmds.append(f"seqtk subseq {q(src)} {q(viral_ids)} | {zip_pipe} > {q(out)}")
     if cmds:
-        run_silent(" & ".join(cmds) + " & wait", log_file=log_f, shell=True, check=False)
+        # Run R1/R2 in parallel and fail if either job fails.
+        script = " ".join(f"( {c} ) & p{i}=$!;" for i, c in enumerate(cmds))
+        script += " " + " && ".join(f"wait $p{i}" for i in range(len(cmds)))
+        run_pipeline(script, log_file=log_f)
 
 # ── Validation & warnings ─────────────────────────────────────────────────────
 
@@ -743,7 +765,7 @@ def _print_completion_panel(
             if v >= good: return f"[bold green]{val}[/bold green]"
             if v >= warn: return f"[bold yellow]{val}[/bold yellow]"
             return f"[bold red]{val}[/bold red]"
-        except: return str(val)
+        except (ValueError, TypeError): return str(val)
 
     def _f(val):
         s = str(val)

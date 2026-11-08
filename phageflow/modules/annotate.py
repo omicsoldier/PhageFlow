@@ -61,7 +61,6 @@ Visualisation
 from __future__ import annotations
 import csv
 import re
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -139,9 +138,12 @@ def run(
     genetic_code = _parse_genetic_code_from_fasta(genome,
                    getattr(cfg.annotate, "genetic_code", 11))
 
-    out_dir  = cfg.results(STEP)
-    rpt_base = cfg.reports(STEP)           # aggregate TSVs live here
-    rpt_dir  = rpt_base / candidate_id     # per-candidate logs and delta report
+    # Candidate IDs (e.g. Drexlerviridae_candidate_001) are numbered per
+    # sample, so outputs must be scoped by sample to avoid collisions — and
+    # to avoid the skip-if-exists logic reusing another sample's annotation.
+    out_dir  = cfg.results(STEP) / sample_id
+    rpt_base = cfg.reports(STEP)                           # aggregate TSVs live here
+    rpt_dir  = rpt_base / sample_id / candidate_id         # per-candidate logs + delta report
     cdir     = out_dir / candidate_id
     mkdirs(cdir, rpt_base, rpt_dir)
 
@@ -156,7 +158,6 @@ def run(
     mode  = "meta" if n_ctg > 1 else "single"
 
     use_gpu    = getattr(cfg.annotate, "phold_gpu",           True)
-    batch_size = getattr(cfg.annotate, "phold_batch_size",    1)
     gpu_tag    = "--foldseek_gpu" if use_gpu else "--cpu"
 
     plot_strategy = (
@@ -169,7 +170,8 @@ def run(
         f"  Genome   : {human_size(genome)} | {n_ctg} contig(s) | "
         f"largest={s['largest_bp']:,} bp | mode={mode}"
     )
-    log_info(f"  [1/4] Pharokka  : PHANOTATE/prodigal-gv + PHROGs MMseqs2 + PyHMMER")
+    log_info(f"  Genetic code : {genetic_code}")
+    log_info("  [1/4] Pharokka  : PHANOTATE/prodigal-gv + PHROGs MMseqs2 + PyHMMER")
     log_info(f"  [2/4] Phold     : ProstT5 + Foldseek --hyps {gpu_tag} (s={_PHOLD_SENSITIVITY})")
     log_info(f"  [4/4] Plot      : {plot_strategy} from Phold GBK")
 
@@ -426,7 +428,7 @@ def _run_phold(cfg, candidate_id, input_gbk, phold_dir, gbk_out, rpt_dir, force)
 
     log_info(
         f"  [Phold] {('--foldseek_gpu' if use_gpu else '--cpu')} | "
-        f"--hyps | sensitivity={_PHOLD_SENSITIVITY} | "
+        f"--hyps | sensitivity={getattr(cfg.annotate, 'phold_sensitivity', _PHOLD_SENSITIVITY)} | "
         f"card_vfdb_evalue={_PHOLD_CARD_EVALUE}"
     )
 
@@ -447,7 +449,7 @@ def _run_phold(cfg, candidate_id, input_gbk, phold_dir, gbk_out, rpt_dir, force)
     try:
         run_silent(cmd, log_file=phold_log)
         log_ok("  [Phold] OK")
-    except Exception as e:
+    except Exception:
         # If we ran with GPU and Foldseek's GPU search failed, retry once on CPU.
         # Many cluster compute nodes lack a physical GPU even when foldseek has
         # GPU support compiled in; CPU search produces identical annotations.
@@ -472,7 +474,7 @@ def _run_phold(cfg, candidate_id, input_gbk, phold_dir, gbk_out, rpt_dir, force)
                 pass
         if no_hits:
             log_warn(
-                f"  [Phold] no structural hits — genome may be too small or highly divergent. "
+                "  [Phold] no structural hits — genome may be too small or highly divergent. "
                 "Using Pharokka GBK as canonical output."
             )
             # Copy Pharokka GBK to Phold location so downstream code finds it
@@ -666,7 +668,6 @@ def _parse_pharokka_per_cds(pharokka_dir: Path, candidate_id: str) -> dict:
     Reference: Bouras et al. 2023, Bioinformatics 39:btac776
     """
     merged_tsv  = pharokka_dir / f"{candidate_id}_cds_final_merged_output.tsv"
-    summary_tsv = pharokka_dir / f"{candidate_id}_cds_functions.tsv"
 
     # Candidate column names for the locus identifier (version-dependent)
     _LOCUS_COLS = ("gene", "locus_tag", "ID", "id", "seq_id")  # Pharokka uses "gene" column
@@ -845,15 +846,12 @@ def _save_delta_report(
     for locus in all_loci:
         r1 = p1_map.get(locus, {})
         r2 = p2_map.get(locus, {})
-        r3 = p3_map.get(locus, {})
 
         t1_annot = r1.get("annot", "").strip()
         t2_prod  = r2.get("product", "").strip()
 
         t1_annotated = t1_annot.lower() not in _UNKNOWN_CATS and t1_annot != ""
         t2_annotated = t2_prod.lower()  not in _UNKNOWN_CATS and t2_prod  != ""
-        t3_conf = 0.0
-        t3_cat  = ""
         t3_predicted = False
 
         if t1_annotated:
@@ -1030,14 +1028,16 @@ def _save_summary_tsv(
     path:         Path,
 ) -> None:
     """Append or update the aggregate annotation_summary.tsv."""
-    rows: dict[str, dict] = {}
+    # Keyed by (sample_id, candidate_id): candidate numbering restarts per sample.
+    rows: dict[tuple[str, str], dict] = {}
     if path.exists():
         with open(path) as f:
             old_hdrs = f.readline().rstrip("\n").split("\t")
             for line in f:
                 cols = line.rstrip("\n").split("\t")
                 if cols and cols[0]:
-                    rows[cols[0]] = dict(zip(old_hdrs, cols))
+                    row = dict(zip(old_hdrs, cols))
+                    rows[(row.get("sample_id", ""), row.get("candidate_id", cols[0]))] = row
 
     s     = fasta_stats(genome)
     total = tier1.get("total_cds",  0)
@@ -1047,7 +1047,7 @@ def _save_summary_tsv(
     final = p1 + p2 + p3
     hypo  = max(0, total - final)
 
-    rows[candidate_id] = {
+    rows[(sample_id, candidate_id)] = {
         "candidate_id":       candidate_id,
         "sample_id":          sample_id,
         "genome_bp":          str(s.get("total_bp", 0)),

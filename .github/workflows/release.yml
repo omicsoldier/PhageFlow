@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -13,16 +16,32 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for tarball availability
-        run: sleep 30
+      - name: Check tag matches package version
+        run: |
+          PKG=$(python3 -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('phageflow/__init__.py').read()).group(1))")
+          PYPROJECT=$(python3 -c "import re;print(re.search(r'^version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          RECIPE=$(python3 -c "import re;print(re.search(r'set version = \"([^\"]+)\"', open('conda-recipe/meta.yaml').read()).group(1))")
+          echo "tag=${{ steps.version.outputs.version }} __init__=$PKG pyproject=$PYPROJECT recipe=$RECIPE"
+          for v in "$PKG" "$PYPROJECT" "$RECIPE"; do
+            if [ "$v" != "${{ steps.version.outputs.version }}" ]; then
+              echo "::error::Version mismatch — bump phageflow/__init__.py, pyproject.toml and conda-recipe/meta.yaml before tagging"
+              exit 1
+            fi
+          done
 
-      - name: Compute sha256
+      - name: Compute sha256 of the source tarball
         id: sha256
         run: |
-          SHA=$(curl -sL https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz | sha256sum | cut -d' ' -f1)
-          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+          URL="https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz"
+          for i in 1 2 3 4 5; do
+            if curl -fsSL "$URL" -o source.tar.gz; then break; fi
+            echo "Tarball not ready yet (attempt $i) — retrying"; sleep $((i * 10))
+          done
+          test -s source.tar.gz
+          SHA=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
           echo "SHA256: $SHA"
 
       - name: Create GitHub Release
@@ -31,12 +50,14 @@ jobs:
           generate_release_notes: true
           body: |
             ## Installation
-```bash
+
+            ```bash
             conda install -c bioconda phageflow=${{ steps.version.outputs.version }}
-```
+            ```
 
             ## Bioconda recipe update
-```yaml
+
+            ```yaml
             {% set version = "${{ steps.version.outputs.version }}" %}
             sha256: ${{ steps.sha256.outputs.sha256 }}
-```
+            ```

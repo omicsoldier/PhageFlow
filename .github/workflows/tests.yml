@@ -4,44 +4,77 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Ruff (errors + pyflakes)
+        run: |
+          pip install ruff
+          ruff check phageflow tests
+      - name: Validate YAML files
+        run: |
+          pip install pyyaml
+          python - <<'PY'
+          import pathlib, yaml
+          files = list(pathlib.Path(".github/workflows").glob("*.yml"))
+          files += [pathlib.Path("environment.yml"), pathlib.Path("phageflow/config/default_config.yaml")]
+          for f in files:
+              yaml.safe_load(f.read_text())
+              print(f"✓ {f}")
+          PY
+
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install
-        run: pip install -e .
+        run: pip install -e ".[dev]"
 
-      - name: Check imports
-        run: |
-          python -c "from phageflow.modules import qc, host_removal, assembly, coverage, viral_id, quality, annotate, resistance, runner"
-          python -c "from phageflow.cli import cli"
-          echo "✓ All imports OK"
+      - name: Unit tests
+        run: pytest -q
 
       - name: Check CLI
         run: |
           phageflow --help
           phageflow --version
+          for cmd in qc host-removal assembly coverage viral-id quality annotate resistance run config init status download-databases; do
+            phageflow "$cmd" --help > /dev/null
+          done
           echo "✓ CLI OK"
 
-      - name: Check config defaults
+      - name: Build package
         run: |
-          python3 -c "
-          from phageflow.utils.config import Config
-          cfg = Config()
-          assert cfg.qc.average_qual == 20
-          assert cfg.qc.length_required == 50
-          assert cfg.genomad.composition == 'auto'
-          assert cfg.genomad.rescue_min_length_bp == 3000
-          assert cfg.checkv.large_nd_rescue_bp == 20000
-          assert '141' not in cfg.assembly.kmers
-          print('✓ Config defaults OK')
-          "
+          pip install build
+          python -m build
+          python - <<'PY'
+          import glob, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          assert "phageflow/config/default_config.yaml" in names, "bundled config missing from wheel"
+          print("✓ wheel contains default_config.yaml")
+          PY

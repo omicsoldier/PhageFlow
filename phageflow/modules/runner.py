@@ -30,9 +30,12 @@ Error handling
 
 from __future__ import annotations
 import traceback
+from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
+from phageflow.utils import status as _status
 from phageflow.utils.config import Config
 from phageflow.utils.logger import (
     log_step, log_info, log_ok, log_warn, log_error,
@@ -97,8 +100,17 @@ def run(
 
     results: dict[str, str] = {}
 
-    for r1, r2 in pairs:
-        sample_id = _infer_sample_id(r1)
+    # Two R1 files that infer to the same sample ID would silently overwrite
+    # each other's outputs — refuse to start instead.
+    ids = [_infer_sample_id(r1) for r1, _ in pairs]
+    dupes = sorted(sid for sid, n in Counter(ids).items() if n > 1)
+    if dupes:
+        raise ValueError(
+            "Several read pairs map to the same sample ID: "
+            f"{', '.join(dupes)}. Rename the FASTQ files so each sample is unique."
+        )
+
+    for (r1, r2), sample_id in zip(pairs, ids):
         log_step(f"Sample : {sample_id}")
         log_info(f"  R1 : {r1}")
         log_info(f"  R2 : {r2}")
@@ -110,10 +122,16 @@ def run(
             )
             results[sample_id] = "ok"
             log_ok(f"  Sample {sample_id} — pipeline complete")
-        except Exception as exc:
-            log_error(f"  Sample {sample_id} FAILED: {exc}")
-            traceback.print_exc()
-            results[sample_id] = f"failed: {exc}"
+        except KeyboardInterrupt:
+            raise
+        except (Exception, SystemExit) as exc:
+            # SystemExit is raised by require_tools() / missing-DB checks; it
+            # must not abort the remaining samples.
+            reason = str(exc) or type(exc).__name__
+            log_error(f"  Sample {sample_id} FAILED: {reason}")
+            if not isinstance(exc, SystemExit):
+                traceback.print_exc()
+            results[sample_id] = f"failed: {reason}"
 
     # ── Final summary ─────────────────────────────────────────────────────────
     log_step("PhageFlow run — summary")
@@ -146,33 +164,61 @@ def _run_sample(
     def _skip(module: str) -> bool:
         """Return True if this module should be skipped (resume mode)."""
         try:
-            return _MODULE_ORDER.index(module) < start_idx
+            skip = _MODULE_ORDER.index(module) < start_idx
         except ValueError:
             return False
+        if skip:
+            log_info(f"  [skip] {module}")
+        return skip
+
+    @contextmanager
+    def _track(module: str, fatal: bool = True) -> Iterator[None]:
+        """Record running/completed/failed in reports/pipeline_status.tsv."""
+        rpt = cfg.reports_dir
+        _status.mark(rpt, sample_id, module, "running")
+        try:
+            yield
+        except BaseException as exc:
+            _status.mark(rpt, sample_id, module, "failed",
+                         notes=(str(exc) or type(exc).__name__)[:200])
+            if fatal or not isinstance(exc, Exception):
+                raise
+            log_warn(f"  [{module}] non-fatal error: {exc} — continuing")
+        else:
+            _status.mark(rpt, sample_id, module, "completed")
+
+    def _require(path: Path, module: str) -> None:
+        """When resuming, fail early with a clear message if an input is missing."""
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"Resume input for '{module}' not found: {path}. "
+                "Run the earlier modules first or choose an earlier --from-module."
+            )
 
     # ── 01 QC ─────────────────────────────────────────────────────────────────
     if not _skip("qc"):
         from phageflow.modules.qc import run as qc_run
-        r1_qc, r2_qc = qc_run(
-            cfg, sample_id=sample_id, r1=r1, r2=r2, force=force,
-        )
+        with _track("qc"):
+            r1_qc, r2_qc = qc_run(
+                cfg, sample_id=sample_id, r1=r1, r2=r2, force=force,
+            )
     else:
-        log_info("  [skip] qc")
         r1_qc = cfg.results("01_qc") / f"{sample_id}_R1.fastq.gz"
         r2_qc = cfg.results("01_qc") / f"{sample_id}_R2.fastq.gz"
 
     # ── 02 Host removal ───────────────────────────────────────────────────────
     if not _skip("host-removal"):
         from phageflow.modules.host_removal import run as hr_run
-        r1_hr, r2_hr, s1 = hr_run(
-            cfg, sample_id=sample_id,
-            r1=r1_qc, r2=r2_qc,
-            force=force,
-            host_file=host_file,
-            accessions=accessions,
-        )
+        _require(r1_qc, "host-removal")
+        with _track("host-removal"):
+            r1_hr, r2_hr, s1 = hr_run(
+                cfg, sample_id=sample_id,
+                r1=r1_qc, r2=r2_qc,
+                force=force,
+                host_file=host_file,
+                accessions=accessions,
+            )
     else:
-        log_info("  [skip] host-removal")
         r1_hr = cfg.results("02_host_removal") / f"{sample_id}_R1.fastq.gz"
         r2_hr = cfg.results("02_host_removal") / f"{sample_id}_R2.fastq.gz"
         s1    = cfg.results("02_host_removal") / f"{sample_id}_singletons.fastq.gz"
@@ -180,49 +226,48 @@ def _run_sample(
     # ── 03 Assembly ───────────────────────────────────────────────────────────
     if not _skip("assembly"):
         from phageflow.modules.assembly import run as asm_run
-        contigs = asm_run(
-            cfg, sample_id=sample_id,
-            r1=r1_hr, r2=r2_hr,
-            s1=s1 if s1.exists() and s1.stat().st_size > 0 else None,
-            force=force,
-        )
+        _require(r1_hr, "assembly")
+        with _track("assembly"):
+            contigs = asm_run(
+                cfg, sample_id=sample_id,
+                r1=r1_hr, r2=r2_hr,
+                s1=s1 if s1.exists() and s1.stat().st_size > 0 else None,
+                force=force,
+            )
     else:
-        log_info("  [skip] assembly")
         contigs = cfg.results("03_assembly") / f"{sample_id}_contigs.fasta"
 
     # ── 03b Coverage ──────────────────────────────────────────────────────────
     if not _skip("coverage"):
-        try:
-            from phageflow.modules.coverage import run as cov_run
+        from phageflow.modules.coverage import run as cov_run
+        with _track("coverage", fatal=False):
             cov_run(
                 cfg, sample_id=sample_id,
                 r1=r1_hr, r2=r2_hr,
                 contigs=contigs,
                 force=force,
             )
-        except Exception as e:
-            log_warn(f"  [coverage] non-fatal error: {e} — continuing")
-    else:
-        log_info("  [skip] coverage")
 
     # ── 04 Viral ID ───────────────────────────────────────────────────────────
     if not _skip("viral-id"):
         from phageflow.modules.viral_id import run as vid_run
-        virus_fna, _ = vid_run(
-            cfg, sample_id=sample_id, contigs=contigs, force=force,
-        )
+        _require(contigs, "viral-id")
+        with _track("viral-id"):
+            virus_fna, _ = vid_run(
+                cfg, sample_id=sample_id, contigs=contigs, force=force,
+            )
     else:
-        log_info("  [skip] viral-id")
         virus_fna = cfg.results("04_viral_id") / f"{sample_id}_virus.fna"
 
     # ── 05 Quality ────────────────────────────────────────────────────────────
     if not _skip("quality"):
         from phageflow.modules.quality import run as qual_run
-        ann_ready, _ = qual_run(
-            cfg, sample_id=sample_id, virus_fna=virus_fna, force=force,
-        )
+        _require(virus_fna, "quality")
+        with _track("quality"):
+            ann_ready, _ = qual_run(
+                cfg, sample_id=sample_id, virus_fna=virus_fna, force=force,
+            )
     else:
-        log_info("  [skip] quality")
         ann_ready = (
             cfg.results("05_quality") / sample_id / "annotation_ready" / "phages"
         )
@@ -231,6 +276,10 @@ def _run_sample(
     candidates = sorted(ann_ready.glob("*.fasta")) if ann_ready.exists() else []
     if not candidates:
         log_warn(f"  [{sample_id}] No annotation_ready candidates — skipping annotate + resistance")
+        for module in ("annotate", "resistance"):
+            if not _skip(module):
+                _status.mark(cfg.reports_dir, sample_id, module, "skipped",
+                             notes="no annotation_ready candidates")
         return
 
     log_info(f"  [{sample_id}] {len(candidates)} candidate(s) → annotate + resistance")
@@ -238,25 +287,30 @@ def _run_sample(
     # ── 06 Annotate (per candidate) ───────────────────────────────────────────
     if not _skip("annotate"):
         from phageflow.modules.annotate import run as ann_run
-        for genome in candidates:
-            try:
-                ann_run(cfg, sample_id=sample_id, genome=genome, force=force)
-            except Exception as e:
-                log_warn(f"  [annotate] {genome.stem}: {e} — continuing")
-    else:
-        log_info("  [skip] annotate")
+        failed: list[str] = []
+        with _track("annotate"):
+            for genome in candidates:
+                try:
+                    ann_run(cfg, sample_id=sample_id, genome=genome, force=force)
+                except Exception as e:
+                    failed.append(genome.stem)
+                    log_warn(f"  [annotate] {genome.stem}: {e} — continuing")
+            if failed and len(failed) == len(candidates):
+                raise RuntimeError(f"annotation failed for all {len(failed)} candidate(s)")
+        if failed:
+            _status.mark(cfg.reports_dir, sample_id, "annotate", "completed",
+                         notes=f"failed: {', '.join(failed)}")
 
     # ── 07 Resistance (per candidate) ─────────────────────────────────────────
     if not _skip("resistance"):
         from phageflow.modules.resistance import run as res_run
-        for genome in candidates:
-            try:
-                res_run(
-                    cfg, sample_id=sample_id,
-                    candidate_id=genome.stem,
-                    force=force,
-                )
-            except Exception as e:
-                log_warn(f"  [resistance] {genome.stem}: {e} — continuing")
-    else:
-        log_info("  [skip] resistance")
+        with _track("resistance", fatal=False):
+            for genome in candidates:
+                try:
+                    res_run(
+                        cfg, sample_id=sample_id,
+                        candidate_id=genome.stem,
+                        force=force,
+                    )
+                except Exception as e:
+                    log_warn(f"  [resistance] {genome.stem}: {e} — continuing")

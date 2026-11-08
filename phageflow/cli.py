@@ -1,20 +1,19 @@
 """PhageFlow command-line interface."""
 
 from __future__ import annotations
-import math
 import multiprocessing
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import click
 
 from phageflow import __version__
 from phageflow.utils.config import load_config, _default_threads
 from phageflow.utils.logger import (
-    log_header, log_info, log_ok, log_warn, log_error, log_step,
+    log_info, log_ok, log_warn, log_error, log_step,
 )
 
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
@@ -132,26 +131,54 @@ def _find_read_pairs(raw_dir: Path) -> list[tuple[Path, Path]]:
         )
     )
 
-    # Identify R1 files by pattern
-    r1_files = [
-        f for f in fastqs
-        if re.search(r"[._\-]R1[._\-]|[._\-]R1\.", f.name, re.IGNORECASE)
-        or re.search(r"[._\-]1[._\-]|[._\-]1\.", f.name, re.IGNORECASE)
-    ]
-
-    for r1 in r1_files:
-        # Build the corresponding R2 name
-        r2_name = re.sub(r"R1", "R2", r1.name, flags=re.IGNORECASE)
-        if r2_name == r1.name:
-            # No R1→R2 substitution worked; try _1→_2
-            r2_name = re.sub(r"([._\-])1([._\-])", r"\g<1>2\2", r1.name)
+    for f in fastqs:
+        r2_name = _r2_name_for(f.name)
+        if r2_name is None:
+            continue  # not an R1 file
         r2 = raw_dir / r2_name
         if r2.exists():
-            pairs.append((r1, r2))
+            pairs.append((f, r2))
         else:
-            log_warn(f"  R1 found but no matching R2: {r1.name}")
+            log_warn(f"  R1 found but no matching R2: {f.name}")
 
     return pairs
+
+
+# R1 mate tokens, most specific first.  Each must be delimited on the left by
+# a separator and on the right by a separator or the FASTQ extension, so that
+# accessions such as ``SRR1234`` or sample names like ``lib10`` never match.
+_R1_TOKEN_PATTERNS = [
+    (r"([._\-])R1([._\-])", r"\g<1>R2\g<2>"),
+    (r"([._\-])r1([._\-])", r"\g<1>r2\g<2>"),
+    (r"([._\-])read1([._\-])", r"\g<1>read2\g<2>"),
+    (r"([._\-])1([._\-])", r"\g<1>2\g<2>"),
+]
+
+
+def _r2_name_for(r1_name: str) -> Optional[str]:
+    """Return the expected R2 filename for an R1 filename, or None.
+
+    Only the *last* mate token before the extension is replaced, so names
+    like ``SRR1234_R1.fastq.gz`` → ``SRR1234_R2.fastq.gz`` (the ``R1`` inside
+    the accession is left untouched) and ``S1_L001_R1_001.fastq.gz`` →
+    ``S1_L001_R2_001.fastq.gz``.
+    """
+    lower = r1_name.lower()
+    ext = next((e for e in _FASTQ_EXTS if lower.endswith(e)), None)
+    if ext is None:
+        return None
+    stem = r1_name[: -len(ext)]
+    # Append a sentinel separator so tokens at the end of the stem match.
+    probe = stem + "."
+    if re.search(r"[._\-](R2|r2|read2)[._\-]", probe):
+        return None  # an R2 file
+    for pattern, repl in _R1_TOKEN_PATTERNS:
+        matches = list(re.finditer(pattern, probe))
+        if matches:
+            m = matches[-1]
+            new = probe[: m.start()] + m.expand(repl) + probe[m.end():]
+            return new[:-1] + r1_name[len(stem):]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -167,11 +194,16 @@ def _load(
     project:     Optional[str] = None,
 ) -> object:
     """Load config.yaml and apply CLI overrides."""
-    
+
     if output_dir is None:
-        log_error("--output-dir is required. Provide -o /path/to/output")
-        sys.exit(1)
-        
+        if project:
+            # A project created with `phageflow init` already has
+            # results/ and reports/ sub-directories — use them.
+            output_dir = str(Path(project))
+        else:
+            log_error("--output-dir is required (or use --project). Provide -o /path/to/output")
+            sys.exit(1)
+
     if project:
         p = Path(project)
         config  = str(p / "config" / "config.yaml")
@@ -195,8 +227,15 @@ def _load(
                 log_error(f"Config file not found: {cfg_path}")
                 sys.exit(1)
 
-    wd  = Path(workdir) if workdir else (Path(".").resolve() if _using_bundled else cfg_path.parent.parent)
-    cfg = load_config(cfg_path, workdir=wd)
+    if workdir:
+        wd = Path(workdir)
+    elif project:
+        wd = Path(project)
+    elif _using_bundled or cfg_path == _user_cfg_path():
+        wd = Path(".").resolve()
+    else:
+        wd = cfg_path.parent.parent
+    cfg = load_config(cfg_path, workdir=wd, is_bundled=_using_bundled)
 
     if output_dir:
         base = Path(output_dir)
@@ -212,6 +251,10 @@ def _load(
 
     _log_threads(cfg)
     return cfg
+
+
+def _user_cfg_path() -> Path:
+    return Path.home() / ".config" / "phageflow" / "config.yaml"
 
 
 def _log_threads(cfg) -> None:
@@ -246,9 +289,12 @@ def common_options(f):
     )(f)
     f = click.option(
         "-o", "--output-dir", "output_dir",
-        required=True,
+        default=None,
         type=click.Path(),
-        help="Base output directory.  results/ and reports/ are created inside it.",
+        help=(
+            "Base output directory.  results/ and reports/ are created inside it.  "
+            "Required unless --project is given (then defaults to the project dir)."
+        ),
     )(f)
     f = click.option(
         "--reports-dir", default=None, type=click.Path(),
@@ -313,17 +359,21 @@ def cli():
       qc              Quality control and trimming (fastp + FastQC + MultiQC)
       host-removal    Remove host reads (bwa-mem2 or Kraken2)
       assembly        De novo assembly (SPAdes + MEGAHIT + cd-hit-est)
+      coverage        Per-contig coverage profiling (CoverM)
       viral-id        Viral identification (geNomad)
       quality         Genome quality and selection (CheckV)
       annotate        Structural annotation (Pharokka → Phold)
+      resistance      AMR / virulence / anti-CRISPR / defense screening
 
     \b
     Or run everything at once:
       run             Execute all modules for samples in a directory
 
     \b
-      config          Copy default config.yaml template
-      init            Initialise a new project directory
+      config              Copy default config.yaml template
+      init                Initialise a new project directory
+      status              Show per-sample / per-module progress
+      download-databases  Download reference databases
     """
 
 
@@ -531,49 +581,12 @@ def _sample_id_from_genome_path(genome: str) -> str:
     """Walk up the genome path looking for the annotation_ready/phages structure."""
     p = Path(genome).resolve()
     parts = p.parts
-    try:
-        idx = parts.index("annotation_ready")
+    if "annotation_ready" in parts:
         # structure: .../{sample_id}/annotation_ready/phages/{candidate}.fasta
-        return parts[idx - 1]
-    except ValueError:
-        return p.stem
-
-
-# ---------------------------------------------------------------------------
-# safety
-# ---------------------------------------------------------------------------
-
-@cli.command("safety")
-@common_options
-@click.option("--sample-id", default=None, help="Sample identifier.")
-@click.option("--genome", required=True, type=click.Path(exists=True))
-def cmd_safety(config, workdir, output_dir, reports_dir, threads, force, project,
-               sample_id, genome):
-    """Biosafety screening: CARD + VFDB."""
-    cfg = _load(config, workdir, output_dir, reports_dir, threads, project)
-    sid = sample_id or _sample_id_from_genome_path(genome)
-    from phageflow.modules.safety import run
-    run(cfg, sample_id=sid, genome=Path(genome), force=force)
-
-
-# ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
-
-@cli.command("report")
-@common_options
-@click.option("--sample-id", default=None, help="Sample identifier.")
-@click.option("--candidate-id", required=True,
-              help="Candidate genome ID (e.g. Podoviridae_candidate_001).")
-def cmd_report(config, workdir, output_dir, reports_dir, threads, force, project,
-               sample_id, candidate_id):
-    """Generate final HTML report for one annotated candidate genome."""
-    cfg = _load(config, workdir, output_dir, reports_dir, threads, project)
-    if not sample_id:
-        log_error("--sample-id is required for the report command.")
-        sys.exit(1)
-    from phageflow.modules.report import run
-    run(cfg, sample_id=sample_id, candidate_id=candidate_id, force=force)
+        idx = parts.index("annotation_ready")
+        if idx > 0:
+            return parts[idx - 1]
+    return p.stem
 
 
 # ---------------------------------------------------------------------------
@@ -611,8 +624,8 @@ def cmd_report(config, workdir, output_dir, reports_dir, threads, force, project
     "--from-module",
     default=None,
     type=click.Choice(
-        ["qc", "host-removal", "assembly", "viral-id",
-         "quality", "annotate", "safety", "report"],
+        ["qc", "host-removal", "assembly", "coverage", "viral-id",
+         "quality", "annotate", "resistance"],
         case_sensitive=False,
     ),
     help="Resume pipeline from this module (skip earlier steps).",
@@ -687,7 +700,7 @@ def cmd_run(config, workdir, output_dir, reports_dir, threads, force, project,
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
     from phageflow.modules.runner import run
-    run(
+    results = run(
         cfg,
         pairs=pairs,
         force=force,
@@ -695,6 +708,10 @@ def cmd_run(config, workdir, output_dir, reports_dir, threads, force, project,
         accessions=accs,
         from_module=from_module,
     )
+    # Non-zero exit when any sample failed, so schedulers (SLURM, CI, make)
+    # can detect partial failures.
+    if any(v != "ok" for v in results.values()):
+        sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # config
@@ -728,7 +745,22 @@ def cmd_resistance(config, workdir, output_dir, reports_dir, threads, force, pro
                    sample_id, candidate_id):
     """AMR, virulence, anti-CRISPR and defense element screening."""
     cfg = _load(config, workdir, output_dir, reports_dir, threads, project)
-    sid = sample_id or candidate_id
+    sid = sample_id
+    if not sid:
+        # Annotation outputs live in results/06_annotation/{sample}/{candidate}/
+        ann_root = cfg.results("06_annotation")
+        hits = sorted(d.parent.name for d in ann_root.glob(f"*/{candidate_id}") if d.is_dir())
+        if len(hits) == 1:
+            sid = hits[0]
+            log_info(f"  sample-id : {sid}  (found in {ann_root})")
+        elif len(hits) > 1:
+            log_error(
+                f"Candidate {candidate_id} exists for several samples "
+                f"({', '.join(hits)}). Pass --sample-id."
+            )
+            sys.exit(1)
+        else:
+            sid = candidate_id  # legacy layout: results/06_annotation/{candidate}/
     from phageflow.modules.resistance import run
     run(cfg, sample_id=sid, candidate_id=candidate_id, force=force)
 # ---------------------------------------------------------------------------
@@ -756,7 +788,6 @@ def cmd_download_databases(output_dir, checkv, genomad, pharokka, phold, kraken2
     Example (individual):
       phageflow download-databases --checkv --genomad -o ~/phageflow_databases
     """
-    import subprocess
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -845,7 +876,11 @@ def cmd_download_databases(output_dir, checkv, genomad, pharokka, phold, kraken2
         log_info("  Extracting Kraken2 database...")
         import tarfile
         with tarfile.open(k2_tar) as tar:
-            tar.extractall(db_dir)
+            # filter="data" blocks path traversal / special files (PEP 706).
+            try:
+                tar.extractall(db_dir, filter="data")
+            except TypeError:  # Python < 3.10.12 without extraction filters
+                tar.extractall(db_dir)
         k2_tar.unlink()
         db_paths["kraken2"] = str(db_dir)
         log_ok(f"  Kraken2 → {db_paths['kraken2']}")
@@ -872,7 +907,7 @@ def cmd_download_databases(output_dir, checkv, genomad, pharokka, phold, kraken2
 
     log_ok(f"  Config written → {user_cfg}")
     log_step("Database setup complete")
-    log_info(f"  Run: phageflow run --r1 R1.fastq.gz --r2 R2.fastq.gz -o results/")
+    log_info("  Run: phageflow run --r1 R1.fastq.gz --r2 R2.fastq.gz -o results/")
 
 # ---------------------------------------------------------------------------
 # init
@@ -940,15 +975,27 @@ def cmd_init(project_dir, force):
 # ---------------------------------------------------------------------------
 
 @cli.command("status")
-@click.option("--project", default=None, type=click.Path())
+@click.option("--project", default=None, type=click.Path(),
+              help="Project directory (reads PROJECT/reports/).")
+@click.option("-o", "--output-dir", "output_dir", default=None, type=click.Path(),
+              help="Base output directory used with `phageflow run -o` (reads DIR/reports/).")
+@click.option("--reports-dir", default=None, type=click.Path(),
+              help="Explicit reports directory.")
 @click.option("--sample-id", default=None)
-def cmd_status(project, sample_id):
+def cmd_status(project, output_dir, reports_dir, sample_id):
     """Show pipeline status for all samples in a project."""
     from rich.console import Console
     from rich.table import Table
     from phageflow.utils import status as _status
 
-    reports_dir = Path(project) / "reports" if project else Path("reports")
+    if reports_dir:
+        reports_dir = Path(reports_dir)
+    elif output_dir:
+        reports_dir = Path(output_dir) / "reports"
+    elif project:
+        reports_dir = Path(project) / "reports"
+    else:
+        reports_dir = Path("reports")
     rows = _status.get_all(reports_dir)
 
     if not rows:

@@ -110,7 +110,7 @@ from phageflow.utils.config import Config
 from phageflow.utils.logger import (
     log_step, log_info, log_ok, log_warn, log_error, console,
 )
-from phageflow.utils.tools import require_tools, run_silent, mkdirs
+from phageflow.utils.tools import require_tools, run_silent, run_pipeline, q, mkdirs
 
 STEP  = "05_quality"
 TOOLS = ["checkv"]
@@ -1126,8 +1126,6 @@ def _write_outputs(
 
     # ── Compute stats ─────────────────────────────────────────────────────────
     tier_counts = Counter(info["tier"] for info in contigs.values())
-    n_ann  = tier_counts.get(_TIER_COMPLETE, 0) + tier_counts.get(_TIER_HQ, 0) + \
-             tier_counts.get(_TIER_MQ, 0) + tier_counts.get(_TIER_LARGE_ND, 0)
     n_bin  = len(written_bins)
     n_draft = tier_counts.get(_TIER_LQ_DRAFT, 0)
     n_derep = tier_counts.get(_TIER_DEREP, 0)
@@ -1351,24 +1349,25 @@ def _read_recruitment_coverage(
 
     try:
         run_silent(["bwa-mem2", "index", str(combined)], log_file=log_f)
-        run_silent(
-            # -M: mark split reads as secondary (consistent with host_removal).
-            # Default parameters used here (not permissive): coverage validation
-            # measures genuine mapping of reads to their source genome.
-            f"bwa-mem2 mem -t {threads} -M {combined} {r1} {r2} "
+        # -M: mark split reads as secondary (consistent with host_removal).
+        # Default parameters used here (not permissive): coverage validation
+        # measures genuine mapping of reads to their source genome.
+        run_pipeline(
+            f"bwa-mem2 mem -t {threads} -M {q(combined)} {q(r1)} {q(r2)} "
             f"| samtools view -@ {min(threads,8)} -bF 2304 -u "
-            f"| samtools sort -@ {min(threads, 8)} -o {bam}",
-            log_file=log_f, shell=True,
+            f"| samtools sort -@ {min(threads, 8)} -o {q(bam)}",
+            log_file=log_f,
         )
         run_silent(["samtools", "index", str(bam)], log_file=log_f)
-        subprocess.run(
-            # -Q 20: skip alignments with mapQ < 20 to avoid
-            # spurious coverage from low-confidence multimappers.
-            ["samtools", "depth", "-a", "-Q", "20", str(bam)],
-            stdout=open(depth_tsv, "w"),
-            stderr=subprocess.DEVNULL,
-            check=True, timeout=600,
-        )
+        # -Q 20: skip alignments with mapQ < 20 to avoid
+        # spurious coverage from low-confidence multimappers.
+        with open(depth_tsv, "w") as depth_fh:
+            subprocess.run(
+                ["samtools", "depth", "-a", "-Q", "20", str(bam)],
+                stdout=depth_fh,
+                stderr=subprocess.DEVNULL,
+                check=True, timeout=600,
+            )
     except Exception as e:
         log_warn(f"  [coverage] alignment failed: {e} — coverage validation skipped")
         return {}

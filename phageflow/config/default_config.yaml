@@ -1,5 +1,4 @@
 project: PhageFlow
-version: "0.1.0"
 
 # Threads: comment out to use auto-detection (90% of logical CPUs).
 # threads: 24
@@ -12,6 +11,10 @@ dirs:
   results: results
   reports: reports
 
+# Databases: relative paths are resolved from the project root.  When this
+# bundled file is used as-is, $PHAGEFLOW_DB (if set) takes precedence; in a
+# project/user config the paths below take precedence over $PHAGEFLOW_DB.
+
 databases:
   checkv:   databases/checkv_db/checkv-db-v1.5
   pharokka: databases/pharokka_db
@@ -23,10 +26,8 @@ envs:
   main: phageflow
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 02 — Host read removal
+# Module 01 — Quality Control (fastp)
 # ─────────────────────────────────────────────────────────────────────────────
-# Module 01 - Quality Control (fastp)
-# All values are read by phageflow/modules/qc.py
 qc:
   average_qual: 20              # read-level mean Q floor; Q20=99% accuracy (Roux et al. 2019 MIUViG)
   qualified_quality_phred: 25   # per-base quality threshold (99% accuracy)
@@ -43,6 +44,9 @@ qc:
   poly_x_min_len: 10            # min poly-X length to trigger trim (bp)
   n_base_limit: 5               # max N calls per read
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Module 02 — Host read removal
+# ─────────────────────────────────────────────────────────────────────────────
 host_removal:
   # NCBI accessions always merged with --host-file / --accessions.
   # Add lab propagation strains here so they are always removed.

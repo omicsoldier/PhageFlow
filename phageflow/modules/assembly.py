@@ -41,9 +41,8 @@ MEGAHIT (Li et al. 2015, Bioinformatics 31:1674)
     k-mers including those from real divergent viral sequences at low
     coverage. Retaining mercy k-mers (frequency 1 at larger k) allows
     assembly of divergent genomes that would otherwise be fragmented.
-  Singletons: merged with paired reads via concatenation, as MEGAHIT
-    does not natively support --s1. This preserves DTR/ITR boundary
-    coverage in the MEGAHIT assembly.
+  Singletons: passed as single-end reads (-r), as MEGAHIT has no --s1.
+    This preserves DTR/ITR boundary coverage in the MEGAHIT assembly.
 
 cd-hit-est NR (Fu et al. 2012, Bioinformatics 28:3150)
   -c 1.00 -aS 0.85: clusters contigs at 100% identity over 85%% of
@@ -225,7 +224,7 @@ def run(
     ) as progress:
         task = progress.add_task("Initializing...", total=4)
 
-        progress.update(task, description="[1/4] SPAdes  — isolate mode + singletons")
+        progress.update(task, description="[1/4] SPAdes  — standard mode + singletons")
         spades_ok = _run_spades(
             r1, r2, s1 if use_s1 else None,
             spades_dir, log_f, cfg.threads, cfg.memory_gb, force,
@@ -236,10 +235,12 @@ def run(
             log_warn(f"  {msg}"); active_warnings.append(msg)
         progress.advance(task)
 
-        progress.update(task, description="[2/4] MEGAHIT — no-mercy high-coverage mode")
+        progress.update(task, description="[2/4] MEGAHIT — paired + singletons")
         megahit_ok = _run_megahit(
             r1, r2, megahit_dir, sample_id,
             megahit_kmers, log_f, cfg.threads, force,
+            s1=Path(s1) if use_s1 else None,
+            min_contig_len=cfg.assembly.min_length,
         )
         if not megahit_ok:
             if not spades_ok:
@@ -357,6 +358,8 @@ def _run_megahit(
     out_dir: Path, prefix: str,
     kmers: str, log_f: Path,
     threads: int, force: bool,
+    s1: Optional[Path] = None,
+    min_contig_len: int = 200,
 ) -> bool:
     final_contigs = out_dir / f"{prefix}.contigs.fa"
     if final_contigs.exists() and final_contigs.stat().st_size > 0 and not force:
@@ -378,16 +381,19 @@ def _run_megahit(
         kmer_flags = ["--k-min", k_min, "--k-max", k_max, "--k-step", k_step]
         log_info(f"  [MEGAHIT] legacy k-mer flags: {' '.join(kmer_flags)}")
 
-    # MEGAHIT does not support --s1 singletons natively.
-    # Pass paired reads directly; singletons are handled by SPAdes --s1.
     cmd = [
         "megahit",
         "-1", str(r1), "-2", str(r2),
+    ]
+    if s1 and Path(s1).exists() and Path(s1).stat().st_size > 0:
+        # Singletons as single-end reads (-r) keep DTR/ITR boundary coverage.
+        cmd += ["-r", str(s1)]
+    cmd += [
         *kmer_flags,
         "--min-count", "2",
         # --no-mercy NOT used: retains frequency-1 k-mers from divergent
         # viral sequences at low coverage (Li et al. 2015).
-        "--min-contig-len", "200",
+        "--min-contig-len", str(min_contig_len),
         "-t", str(threads),
         "-o", str(out_dir),
         "--out-prefix", prefix,
@@ -597,7 +603,7 @@ def _print_completion_panel(
             v = int(val)
             return (f"[bold green]{v:,}[/bold green]" if v > 0
                     else f"[bold red]{v:,}[/bold red]")
-        except: return str(val)
+        except (ValueError, TypeError): return str(val)
 
     spades_str  = "[green]✓[/green]" if spades_ok  else "[red]✗ failed[/red]"
     megahit_str = "[green]✓[/green]" if megahit_ok else "[red]✗ failed[/red]"

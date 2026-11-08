@@ -3,6 +3,7 @@ channels:
   - conda-forge
   - bioconda
   - defaults
+# Minimum versions mirror conda-recipe/meta.yaml — keep both in sync.
 dependencies:
   # ── Python runtime ──────────────────────────────────────────────────────────
   - python=3.11
@@ -15,12 +16,11 @@ dependencies:
   - numpy>=1.24
   - matplotlib>=3.7
   - pygenomeviz>=0.4.0
-  - tqdm
 
   # ── Module 01 — QC ──────────────────────────────────────────────────────────
-  - fastp>=0.23
-  - fastqc
-  - multiqc
+  - fastp>=1.3
+  - fastqc>=0.12
+  - multiqc>=1.35
 
   # ── Module 02 — Host removal ─────────────────────────────────────────────────
   - bwa-mem2
@@ -31,7 +31,7 @@ dependencies:
   - pigz
 
   # ── Module 03 — Assembly ─────────────────────────────────────────────────────
-  - spades>=4.0
+  - spades>=4.2
   - megahit>=1.2.9
   - cd-hit
 
@@ -42,16 +42,16 @@ dependencies:
   - genomad>=1.8
 
   # ── Module 05 — Quality ──────────────────────────────────────────────────────
-  - checkv>=1.0
+  - checkv>=1.1
   - mash>=2.3
   - minimap2>=2.24
   - blast>=2.14          # provides blastn + makeblastdb (quality.py dereplication)
 
   # ── Module 06 — Annotation ───────────────────────────────────────────────────
-  - pharokka>=1.7
-  - phold>=1.0
-  - dnaapler>=0.7
+  - pharokka>=1.9
+  - phold>=1.2
+  - dnaapler>=1.3
 
   # ── PhageFlow ─────────────────────────────────────────────────────────────────
   - pip:
-    - -e .
+    - -e ".[dev]"
